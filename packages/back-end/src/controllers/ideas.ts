@@ -1,4 +1,5 @@
 import { Response } from "express";
+import { FilterQuery } from "mongoose";
 import { AuthRequest } from "../types/AuthRequest";
 import {
   getIdeasByOrganization,
@@ -18,7 +19,6 @@ import {
 } from "../models/ImpactEstimateModel";
 import { ImpactEstimateInterface } from "../../types/impact-estimate";
 import { ExperimentModel } from "../models/ExperimentModel";
-import { FilterQuery } from "mongoose";
 import { IdeaDocument } from "../models/IdeasModel";
 
 export async function getIdeas(
@@ -45,7 +45,7 @@ export async function getEstimatedImpact(
   res: Response
 ) {
   req.checkPermissions("createIdeas", "");
-  req.checkPermissions("runQueries");
+  req.checkPermissions("runQueries", "");
 
   const { metric, segment } = req.body;
 
@@ -68,7 +68,7 @@ export async function postEstimatedImpactManual(
   res: Response
 ) {
   req.checkPermissions("createIdeas", "");
-  req.checkPermissions("runQueries");
+  req.checkPermissions("runQueries", "");
 
   const { org } = getOrgFromReq(req);
   const { conversionsPerDay, metric } = req.body;

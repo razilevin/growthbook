@@ -36,7 +36,8 @@ export type CommercialFeature =
   | "sso"
   | "advanced-permissions"
   | "encrypt-features-endpoint"
-  | "override-metrics";
+  | "override-metrics"
+  | "schedule-feature-flag";
 export type CommercialFeaturesMap = Record<AccountPlan, Set<CommercialFeature>>;
 
 export interface MemberRoleInfo {
@@ -142,6 +143,8 @@ export interface OrganizationSettings {
   videoInstructionsViewed?: boolean;
   multipleExposureMinPercent?: number;
   defaultRole?: MemberRoleInfo;
+  statsEngine?: "bayesian" | "frequentist";
+  pValueThreshold?: number;
   /** @deprecated */
   implementationTypes?: ImplementationType[];
 }
@@ -199,6 +202,7 @@ export interface OrganizationInterface {
     planNickname: string | null;
     priceId?: string;
   };
+  licenseKey?: string;
   members: Member[];
   invites: Invite[];
   connections?: OrganizationConnections;
@@ -221,6 +225,8 @@ export type LicenseData = {
   ref: string;
   // Name of organization on the license
   sub: string;
+  // Organization ID (keys prior to 12/2022 do not contain this field)
+  org?: string;
   // Max number of seats
   qty: number;
   // Date issued

@@ -1,4 +1,17 @@
-import { ExperimentDocument, ExperimentModel } from "../models/ExperimentModel";
+import uniqid from "uniqid";
+import { FilterQuery } from "mongoose";
+import uniqBy from "lodash/uniqBy";
+import each from "lodash/each";
+import cloneDeep from "lodash/cloneDeep";
+import cronParser from "cron-parser";
+import {
+  ExperimentDocument,
+  ExperimentModel,
+  findExperiment,
+  logExperimentCreated,
+  logExperimentDeleted,
+  logExperimentUpdated,
+} from "../models/ExperimentModel";
 import {
   SnapshotVariation,
   ExperimentSnapshotInterface,
@@ -8,13 +21,9 @@ import {
   insertMetric,
   updateMetric,
 } from "../models/MetricModel";
-import uniqid from "uniqid";
-import { analyzeExperimentMetric } from "./stats";
 import { checkSrm } from "../util/stats";
-import { getSourceIntegrationObject } from "./datasource";
 import { addTags } from "../models/TagModel";
 import { WatchModel } from "../models/WatchModel";
-import { getMetricValue, QueryMap, startRun } from "./queries";
 import {
   PastExperimentResult,
   Dimension,
@@ -34,27 +43,29 @@ import {
 import { SegmentInterface } from "../../types/segment";
 import { ExperimentInterface } from "../../types/experiment";
 import { PastExperiment } from "../../types/past-experiments";
-import { FilterQuery } from "mongoose";
 import { queueWebhook } from "../jobs/webhooks";
 import { queueCDNInvalidate } from "../jobs/cacheInvalidate";
 import { promiseAllChunks } from "../util/promise";
 import { findDimensionById } from "../models/DimensionModel";
+import { getValidDate } from "../util/dates";
+import { getDataSourceById } from "../models/DataSourceModel";
+import { SegmentModel } from "../models/SegmentModel";
+import { EXPERIMENT_REFRESH_FREQUENCY } from "../util/secrets";
+import {
+  ExperimentUpdateSchedule,
+  OrganizationInterface,
+  OrganizationSettings,
+} from "../../types/organization";
+import { logger } from "../util/logger";
+import { getSDKPayloadKeys } from "../util/features";
 import {
   getReportVariations,
   reportArgsFromSnapshot,
   startExperimentAnalysis,
 } from "./reports";
-import { getValidDate } from "../util/dates";
-import { getDataSourceById } from "../models/DataSourceModel";
-import { SegmentModel } from "../models/SegmentModel";
-import uniqBy from "lodash/uniqBy";
-import { EXPERIMENT_REFRESH_FREQUENCY } from "../util/secrets";
-import cronParser from "cron-parser";
-import {
-  ExperimentUpdateSchedule,
-  OrganizationInterface,
-} from "../../types/organization";
-import { logger } from "../util/logger";
+import { getMetricValue, QueryMap, startRun } from "./queries";
+import { getSourceIntegrationObject } from "./datasource";
+import { analyzeExperimentMetric } from "./stats";
 
 export const DEFAULT_METRIC_ANALYSIS_DAYS = 90;
 
@@ -157,41 +168,126 @@ export async function getExperimentsByMetric(
 
 export async function removeMetricFromExperiments(
   metricId: string,
-  orgId: string
+  organization: OrganizationInterface
 ) {
+  const oldExperiments: Record<
+    string,
+    {
+      previous: ExperimentInterface | null;
+      current: ExperimentInterface | null;
+    }
+  > = {};
+
+  const orgId = organization.id;
+
+  const metricQuery = { organization: orgId, metrics: metricId };
+  const guardRailsQuery = { organization: orgId, guardrails: metricId };
+  const activationMetricQuery = {
+    organization: orgId,
+    activationMetric: metricId,
+  };
+  const docsToTrackChanges = await ExperimentModel.find({
+    $or: [metricQuery, guardRailsQuery, activationMetricQuery],
+  });
+  docsToTrackChanges.forEach((experiment: ExperimentDocument) => {
+    if (!oldExperiments[experiment.id]) {
+      oldExperiments[experiment.id] = {
+        previous: experiment,
+        current: null,
+      };
+    }
+  });
+
   // Remove from metrics
-  await ExperimentModel.updateMany(
-    { organization: orgId, metrics: metricId },
-    { $pull: { metrics: metricId } }
-  );
+  await ExperimentModel.updateMany(metricQuery, {
+    $pull: { metrics: metricId },
+  });
 
   // Remove from guardrails
-  await ExperimentModel.updateMany(
-    { organization: orgId, guardrails: metricId },
-    { $pull: { guardrails: metricId } }
-  );
+  await ExperimentModel.updateMany(guardRailsQuery, {
+    $pull: { guardrails: metricId },
+  });
 
   // Remove from activationMetric
-  await ExperimentModel.updateMany(
-    { organization: orgId, activationMetric: metricId },
-    { $set: { activationMetric: "" } }
-  );
+  await ExperimentModel.updateMany(activationMetricQuery, {
+    $set: { activationMetric: "" },
+  });
+
+  const ids = Object.keys(oldExperiments);
+  const updatedExperiments = await ExperimentModel.find({ id: { $in: ids } });
+  // Populate updated experiments
+  updatedExperiments.forEach((experiment) => {
+    const changeSet = oldExperiments[experiment.id];
+    if (changeSet) {
+      changeSet.current = experiment;
+    }
+  });
+
+  // Log all the changes
+  each(oldExperiments, async (changeSet) => {
+    const { previous, current } = changeSet;
+    if (current && previous) {
+      await logExperimentUpdated({
+        organization,
+        current,
+        previous,
+      });
+    }
+  });
 }
 
-export function deleteExperimentById(id: string) {
+export async function removeProjectFromExperiments(
+  project: string,
+  organization: OrganizationInterface
+) {
+  const query = { organization: organization.id, project };
+  const previousExperiments = await ExperimentModel.find(query);
+
+  await ExperimentModel.updateMany(query, { $set: { project: "" } });
+
+  previousExperiments.forEach((previous) => {
+    const current = cloneDeep(previous);
+    current.project = "";
+
+    logExperimentUpdated({
+      organization,
+      previous,
+      current,
+    });
+  });
+}
+
+/**
+ * Deletes an experiment by ID and logs the event for the organization
+ * @param id
+ * @param organization
+ */
+export async function deleteExperimentByIdForOrganization(
+  id: string,
+  organization: OrganizationInterface
+) {
+  try {
+    const previous = await findExperiment({
+      experimentId: id,
+      organizationId: organization.id,
+    });
+    if (previous) {
+      await logExperimentDeleted(organization, previous);
+    }
+  } catch (e) {
+    logger.error(e);
+  }
+
   return ExperimentModel.deleteOne({
     id,
   });
 }
 
 export async function getExperimentsUsingSegment(id: string, orgId: string) {
-  return ExperimentModel.find(
-    {
-      organization: orgId,
-      segment: id,
-    },
-    { id: 1, name: 1 }
-  );
+  return ExperimentModel.find({
+    organization: orgId,
+    segment: id,
+  });
 }
 
 export async function getLatestSnapshot(
@@ -320,6 +416,7 @@ export async function refreshMetric(
     const from = new Date();
     from.setDate(from.getDate() - days);
     const to = new Date();
+    to.setDate(to.getDate() + 1);
 
     const baseParams: Omit<MetricValueParams, "metric"> = {
       from,
@@ -432,6 +529,8 @@ export async function createExperiment(
     nextSnapshotAttempt: nextUpdate,
   });
 
+  await logExperimentCreated(organization, exp);
+
   if (data.tags) {
     await addTags(data.organization, data.tags);
   }
@@ -505,7 +604,8 @@ export async function createManualSnapshot(
   users: number[],
   metrics: {
     [key: string]: MetricStats[];
-  }
+  },
+  statsEngine?: OrganizationSettings["statsEngine"]
 ) {
   const { srm, variations } = await getManualSnapshotData(
     experiment,
@@ -531,6 +631,7 @@ export async function createManualSnapshot(
         variations,
       },
     ],
+    statsEngine,
   };
 
   const snapshot = await ExperimentSnapshotModel.create(data);
@@ -599,8 +700,11 @@ export async function createSnapshot(
   phaseIndex: number,
   organization: OrganizationInterface,
   dimensionId: string | null,
-  useCache: boolean = false
+  useCache: boolean = false,
+  statsEngine: OrganizationSettings["statsEngine"]
 ) {
+  const previousExperiment = cloneDeep(experiment);
+
   const phase = experiment.phases[phaseIndex];
   if (!phase) {
     throw new Error("Invalid snapshot phase");
@@ -626,11 +730,12 @@ export async function createSnapshot(
     segment: experiment.segment || "",
     queryFilter: experiment.queryFilter || "",
     skipPartialData: experiment.skipPartialData || false,
+    statsEngine,
   };
 
-  const nextUpdate = determineNextDate(
-    organization.settings?.updateSchedule || null
-  );
+  const nextUpdate =
+    determineNextDate(organization.settings?.updateSchedule || null) ||
+    undefined;
 
   await ExperimentModel.updateOne(
     {
@@ -646,10 +751,28 @@ export async function createSnapshot(
     }
   );
 
+  try {
+    const updatedExperiment = await findExperiment({
+      organizationId: experiment.organization,
+      experimentId: experiment.id,
+    });
+
+    if (updatedExperiment) {
+      await logExperimentUpdated({
+        organization,
+        previous: previousExperiment,
+        current: updatedExperiment,
+      });
+    }
+  } catch (e) {
+    logger.error(e);
+  }
+
   const { queries, results } = await startExperimentAnalysis(
     experiment.organization,
     reportArgsFromSnapshot(experiment, data),
-    useCache
+    useCache,
+    statsEngine
   );
 
   data.queries = queries;
@@ -796,13 +919,13 @@ export async function experimentUpdated(
   experiment: ExperimentInterface,
   previousProject: string = ""
 ) {
-  // fire the webhook:
-  await queueWebhook(
-    experiment.organization,
-    ["dev", "production"],
-    [previousProject || "", experiment.project || ""],
-    false
+  const payloadKeys = getSDKPayloadKeys(
+    new Set(["dev", "production"]),
+    new Set(["", previousProject || "", experiment.project || ""])
   );
+
+  // fire the webhook:
+  await queueWebhook(experiment.organization, payloadKeys, false);
 
   // invalidate the CDN
   await queueCDNInvalidate(experiment.organization, (key) => {
@@ -812,3 +935,35 @@ export async function experimentUpdated(
       : `/config/${key}`;
   });
 }
+
+/**
+ * Removes the tag from any experiments that have it
+ * and logs the experiment.updated event
+ * @param organization
+ * @param tag
+ */
+export const removeTagFromExperiments = async ({
+  organization,
+  tag,
+}: {
+  organization: OrganizationInterface;
+  tag: string;
+}): Promise<void> => {
+  const query = { organization: organization.id, tags: tag };
+  const previousExperiments = await ExperimentModel.find(query);
+
+  await ExperimentModel.updateMany(query, {
+    $pull: { tags: tag },
+  });
+
+  previousExperiments.forEach((previous) => {
+    const current = cloneDeep(previous);
+    current.tags = current.tags.filter((t) => t != tag);
+
+    logExperimentUpdated({
+      organization,
+      previous,
+      current,
+    });
+  });
+};

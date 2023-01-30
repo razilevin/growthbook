@@ -1,12 +1,14 @@
 import { Response } from "express";
-import { AuthRequest } from "../types/AuthRequest";
+import uniqid from "uniqid";
+import format from "date-fns/format";
+import { AuthRequest, ResponseWithStatusAndError } from "../types/AuthRequest";
 import {
   getExperimentsByOrganization,
   getExperimentById,
   getLatestSnapshot,
   createExperiment,
   createSnapshot,
-  deleteExperimentById,
+  deleteExperimentByIdForOrganization,
   createManualSnapshot,
   getManualSnapshotData,
   ensureWatching,
@@ -15,7 +17,6 @@ import {
   getExperimentWatchers,
   getExperimentByTrackingKey,
 } from "../services/experiments";
-import uniqid from "uniqid";
 import { MetricStats } from "../../types/metric";
 import { ExperimentModel } from "../models/ExperimentModel";
 import {
@@ -32,7 +33,6 @@ import {
   cancelRun,
   getPastExperiments,
 } from "../services/queries";
-import format from "date-fns/format";
 import { PastExperimentsModel } from "../models/PastExperimentsModel";
 import {
   ExperimentInterface,
@@ -144,6 +144,28 @@ export async function getExperimentsFrequencyMonth(
   res.status(200).json({
     status: 200,
     data: { all: allData, ...dataByStatus },
+  });
+}
+
+export async function lookupExperimentByTrackingKey(
+  req: AuthRequest<unknown, unknown, { trackingKey: string }>,
+  res: ResponseWithStatusAndError<{ experimentId: string | null }>
+) {
+  const { org } = getOrgFromReq(req);
+  const { trackingKey } = req.query;
+
+  if (!trackingKey) {
+    return res.status(400).json({
+      status: 400,
+      message: "Tracking key cannot be empty",
+    });
+  }
+
+  const experiment = await getExperimentByTrackingKey(org.id, trackingKey + "");
+
+  return res.status(200).json({
+    status: 200,
+    experimentId: experiment?.id || null,
   });
 }
 
@@ -1239,7 +1261,7 @@ export async function deleteExperiment(
   await Promise.all([
     // note: we might want to change this to change the status to
     // 'deleted' instead of actually deleting the document.
-    deleteExperimentById(exp.id),
+    deleteExperimentByIdForOrganization(exp.id, org),
     removeExperimentFromPresentations(exp.id),
   ]);
 
@@ -1341,7 +1363,8 @@ export async function getSnapshotStatus(
         org.id,
         getReportVariations(experiment, phase),
         snapshot.dimension || undefined,
-        queryData
+        queryData,
+        org.settings?.statsEngine
       ),
     async (updates, results, error) => {
       await ExperimentSnapshotModel.updateOne(
@@ -1370,7 +1393,7 @@ export async function cancelSnapshot(
   req: AuthRequest<null, { id: string }>,
   res: Response
 ) {
-  req.checkPermissions("runQueries");
+  req.checkPermissions("runQueries", "");
 
   const { org } = getOrgFromReq(req);
   const { id } = req.params;
@@ -1405,9 +1428,10 @@ export async function postSnapshot(
   >,
   res: Response
 ) {
-  req.checkPermissions("runQueries");
+  req.checkPermissions("runQueries", "");
 
   const { org } = getOrgFromReq(req);
+  const statsEngine = org.settings?.statsEngine;
 
   const useCache = !req.query["force"];
 
@@ -1443,7 +1467,13 @@ export async function postSnapshot(
     }
 
     try {
-      const snapshot = await createManualSnapshot(exp, phase, users, metrics);
+      const snapshot = await createManualSnapshot(
+        exp,
+        phase,
+        users,
+        metrics,
+        statsEngine
+      );
       res.status(200).json({
         status: 200,
         snapshot,
@@ -1487,7 +1517,8 @@ export async function postSnapshot(
       phase,
       org,
       dimension || null,
-      useCache
+      useCache,
+      org.settings?.statsEngine
     );
     await req.audit({
       event: "experiment.refresh",
@@ -1684,7 +1715,7 @@ export async function cancelPastExperiments(
   req: AuthRequest<null, { id: string }>,
   res: Response
 ) {
-  req.checkPermissions("runQueries");
+  req.checkPermissions("runQueries", "");
 
   const { org } = getOrgFromReq(req);
   const { id } = req.params;
@@ -1756,8 +1787,6 @@ export async function postPastExperiments(
   req: AuthRequest<{ datasource: string; force: boolean }>,
   res: Response
 ) {
-  req.checkPermissions("runQueries");
-
   const { org } = getOrgFromReq(req);
   const { datasource, force } = req.body;
 
@@ -1765,6 +1794,10 @@ export async function postPastExperiments(
   if (!datasourceObj) {
     throw new Error("Could not find datasource");
   }
+  req.checkPermissions(
+    "runQueries",
+    datasourceObj?.projects?.length ? datasourceObj.projects : ""
+  );
 
   const integration = getSourceIntegrationObject(datasourceObj);
   if (integration.decryptionError) {

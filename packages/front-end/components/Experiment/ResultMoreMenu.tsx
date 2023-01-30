@@ -7,14 +7,14 @@ import {
   ExperimentReportVariation,
   ReportInterface,
 } from "back-end/types/report";
-import { useAuth } from "../../services/auth";
-import Button from "../Button";
-import MoreMenu from "../Dropdown/MoreMenu";
-import ViewAsyncQueriesButton from "../Queries/ViewAsyncQueriesButton";
 import { BsArrowRepeat } from "react-icons/bs";
-import usePermissions from "../../hooks/usePermissions";
-import ResultsDownloadButton from "./ResultsDownloadButton";
-import Tooltip from "../Tooltip/Tooltip";
+import { useAuth } from "@/services/auth";
+import usePermissions from "@/hooks/usePermissions";
+import ResultsDownloadButton from "@/components/Experiment/ResultsDownloadButton";
+import Button from "@/components/Button";
+import MoreMenu from "@/components/Dropdown/MoreMenu";
+import ViewAsyncQueriesButton from "@/components/Queries/ViewAsyncQueriesButton";
+import Tooltip from "@/components/Tooltip/Tooltip";
 
 export default function ResultMoreMenu({
   editMetrics,
@@ -69,7 +69,7 @@ export default function ResultMoreMenu({
     notebookFilename;
 
   return (
-    <MoreMenu id="exp-result-actions">
+    <MoreMenu>
       {canEdit && (
         <button
           className="btn dropdown-item py-2"
@@ -88,7 +88,7 @@ export default function ResultMoreMenu({
           className="dropdown-item py-2"
         />
       )}
-      {forceRefresh && permissions.runQueries && (
+      {forceRefresh && permissions.check("runQueries", "") && (
         <button
           className="btn dropdown-item py-2"
           onClick={(e) => {

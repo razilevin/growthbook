@@ -1,8 +1,8 @@
+import fs from "fs";
+import path from "path";
 import { Request, Response } from "express";
 import { getExperimentsByOrganization } from "../services/experiments";
 import { lookupOrganizationByApiKey } from "../models/ApiKeyModel";
-import fs from "fs";
-import path from "path";
 import { APP_ORIGIN } from "../util/secrets";
 import { ExperimentInterface } from "../../types/experiment";
 import { ErrorResponse, ExperimentOverridesResponse } from "../../types/api";
@@ -84,7 +84,7 @@ type CompressedExperimentOptions = {
 const baseScript = fs
   .readFileSync(path.join(__dirname, "..", "templates", "javascript.js"))
   .toString("utf-8")
-  .replace(/.*eslint-.*\n/g, "")
+  .replace(/\/\*\s*eslint-.*\*\//, "")
   .replace(/\n\/\/.*/g, "");
 
 export async function getExperimentsScript(
